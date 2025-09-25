@@ -1,0 +1,14 @@
+FROM bitnami/python:3.12
+
+ENV TZ=Asia/Shanghai \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
+    PIP_TRUSTED_HOST=mirrors.aliyun.com \
+    PYTHONUNBUFFERED=1
+
+
+WORKDIR /app
+COPY fetch_bilibili.py /app/fetch_bilibili.py
+
+RUN pip install --no-cache-dir requests kafka-python pydantic
+
+CMD ["python", "fetch_bilibili.py"]
