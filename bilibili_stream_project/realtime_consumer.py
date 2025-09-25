@@ -10,11 +10,22 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.types import StructType, StringType, IntegerType, TimestampType
 
+import tempfile
+import pyspark
+
 print("[启动] realtime_consumer 启动 …")
 # ================= 环境变量 =================
 
 def _get_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "y")
+
+# 动态推断 PySpark 版本与 Kafka 连接器坐标
+SPARK_VERSION = pyspark.__version__
+SPARK_SCALA_BINARY = os.getenv("SPARK_SCALA_BINARY", "2.12")
+SPARK_KAFKA_PACKAGE = os.getenv(
+    "SPARK_KAFKA_PACKAGE",
+    f"org.apache.spark:spark-sql-kafka-0-10_{SPARK_SCALA_BINARY}:{SPARK_VERSION}"
+)
 
 # 权重与参数
 WEIGHT_VIEW = float(os.getenv("WEIGHT_VIEW", "0.05"))
@@ -32,7 +43,8 @@ COEF_RATIO = float(os.getenv("COEF_RATIO", "0.2"))
 MOMENTUM_CLIP = float(os.getenv("MOMENTUM_CLIP", "0.5"))
 
 # 运行配置
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+# 本地调试时使用 localhost:9092；如在容器/集群里再改回对应地址
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 TOPIC = os.getenv("TOPIC", "bilibili_videos")
 STARTING_OFFSETS = "earliest"  # 强制 earliest，确保能消费所有历史数据
 WINDOW_DURATION = os.getenv("WINDOW_DURATION", "24 hours")
@@ -51,6 +63,9 @@ SKIP_ZERO_WINDOWS = _get_bool("SKIP_ZERO_WINDOWS", "true")
 MIN_NONZERO_CATEGORIES = int(os.getenv("MIN_NONZERO_CATEGORIES", "2"))
 MIN_TOTAL_RAW_SUM = int(os.getenv("MIN_TOTAL_RAW_SUM", "10"))
 
+# 将 checkpoint 放到本地可写目录
+CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", os.path.join(tempfile.gettempdir(), "ck_round_batch"))
+
 print(f"[启动] 参数: window={WINDOW_DURATION}/{WINDOW_SLIDE} watermark={WATERMARK_DELAY} trigger={TRIGGER_SECONDS}s")
 
 # ================= Spark 初始化 =================
@@ -58,10 +73,13 @@ print(f"[启动] 参数: window={WINDOW_DURATION}/{WINDOW_SLIDE} watermark={WATE
 builder = (SparkSession.builder
            .appName("BilibiliHotStreaming")
            .config("spark.sql.shuffle.partitions", "4")
-           .config("spark.sql.session.timeZone", "UTC"))
+           .config("spark.sql.session.timeZone", "UTC")
+           .config("spark.jars.packages", SPARK_KAFKA_PACKAGE)
+           )
 spark = builder.getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
 print("[启动] Spark 会话创建成功")
+print(f"[启动] 使用 Kafka 连接器: {SPARK_KAFKA_PACKAGE}")
 
 # ================= 读取 Kafka =================
 
@@ -70,7 +88,7 @@ raw_df = (spark.readStream.format("kafka")
           .option("subscribe", TOPIC)
           .option("startingOffsets", STARTING_OFFSETS)
           .load())
-print(f"[启动] Kafka 源已创建 topic={TOPIC} startingOffsets={STARTING_OFFSETS}")
+print(f"[启动] Kafka 源已创建 topic={TOPIC} startingOffsets={STARTING_OFFSETS} bootstrap={KAFKA_BOOTSTRAP}")
 
 schema = (StructType()
           .add("bvid", StringType())
@@ -202,10 +220,10 @@ query = (base_df.writeStream
          .outputMode("append")
          .queryName("round_batch")
          .foreachBatch(process_round)
-         .option("checkpointLocation", "/tmp/ck_round_batch")
+         .option("checkpointLocation", CHECKPOINT_DIR)
          .trigger(processingTime=f"{TRIGGER_SECONDS} seconds")
          .start())
-print(f"[启动] 批处理流式查询已启动 (trigger={TRIGGER_SECONDS}s)")
+print(f"[启动] 批处理流式查询已启动 (trigger={TRIGGER_SECONDS}s, checkpoint={CHECKPOINT_DIR})")
 
 import threading, time
 

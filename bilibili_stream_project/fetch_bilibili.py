@@ -9,9 +9,6 @@ from kafka import KafkaProducer
 from pydantic import BaseModel, Field, ValidationError
 import re
 
-# ========================
-# 分类映射（与 B 站 rid 对应）
-# ========================
 categories = {
     "番剧": 13, "国创": 167, "音乐": 3, "舞蹈": 129, "游戏": 4,
     "知识": 36, "美食": 211, "生活": 160, "鬼畜": 119, "时尚": 155,
@@ -19,15 +16,18 @@ categories = {
     "动物圈": 217, "纪录片": 177, "电影": 23, "TV剧集": 11, "综艺": 71
 }
 
-# ========================
-# 环境变量配置
-# ========================
-KAFKA_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+# 兼容多种环境变量名
+KAFKA_SERVERS = (
+    os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+    or os.getenv("KAFKA_BOOTSTRAP")
+    or os.getenv("KAFKA_SERVERS")
+    or "kafka:9092"
+)
 TOPIC = os.getenv("TOPIC", "bilibili_videos")
 CONTROL_CATEGORY = "__MARKER__"
 MARKER_NAME = "ROUND_END"
-FETCH_MODE = os.getenv("FETCH_MODE", "hot").lower()  # hot 或 new
-HOT_DAYS = os.getenv("HOT_DAYS", "3")  # 1|3|7
+FETCH_MODE = os.getenv("FETCH_MODE", "hot").lower()
+HOT_DAYS = os.getenv("HOT_DAYS", "3")
 INTERVAL = int(os.getenv("FETCH_INTERVAL", "300"))
 LIMIT = int(os.getenv("LIMIT", "60"))
 DEDUP = os.getenv("DEDUP", "false").lower() == "true"
@@ -39,9 +39,8 @@ DETAIL_CALL_LIMIT = int(os.getenv("DETAIL_CALL_LIMIT", "20"))
 DETAIL_CACHE_TTL = int(os.getenv("DETAIL_CACHE_TTL", "600"))
 BILI_COOKIE = os.getenv("BILI_COOKIE")
 ENABLE_FALLBACK_KEYS = os.getenv("ENABLE_FALLBACK_KEYS", "true").lower() == "true"
-DROP_ZERO_VIDEOS = os.getenv("DROP_ZERO_VIDEOS", "true").lower() == "true"  # 新增：丢弃全零视频
+DROP_ZERO_VIDEOS = os.getenv("DROP_ZERO_VIDEOS", "true").lower() == "true"
 
-# 统计计数器（补充缺失，避免 NameError）
 zero_video_counter: Dict[str, int] = {}
 nonzero_video_counter: Dict[str, int] = {}
 
@@ -49,7 +48,6 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 RETRY = int(os.getenv("RETRY", "2"))
 PARSE_CHINESE_NUM = os.getenv("PARSE_CHINESE_NUM", "true").lower() == "true"
 
-# 回退字段映射：按顺序寻找非零
 FALLBACK_KEY_MAP = {
     "view": ["view", "play", "plays"],
     "like": ["like", "likes"],
@@ -76,9 +74,6 @@ class Video(BaseModel):
     engagement: int = Field(ge=0)
     collect_time: datetime
 
-# ========================
-# 数值解析辅助 (处理中文单位/千分位)
-# ========================
 _num_pattern = re.compile(r"^[0-9,.]+(万|亿)?$")
 
 def _parse_number(val) -> int:
@@ -102,18 +97,13 @@ def _parse_number(val) -> int:
             if s == '':
                 return 0
             return int(float(s) * unit)
-        # 普通纯数字带逗号
         s2 = s.replace(',', '')
         if s2.isdigit():
             return int(s2)
-        # 尝试 float
         return int(float(s2))
     except Exception:
         return 0
 
-# ========================
-# 会话与请求
-# ========================
 session = requests.Session()
 base_headers = {
     "User-Agent": "Mozilla/5.0",
@@ -126,19 +116,14 @@ if BILI_COOKIE:
     base_headers["Cookie"] = BILI_COOKIE
 session.headers.update(base_headers)
 
-# ========================
-# 工具函数
-# ========================
-
 def _safe_get_json(url: str) -> Optional[dict]:
     for i in range(RETRY + 1):
         try:
             r = session.get(url, timeout=REQUEST_TIMEOUT)
             return r.json()
         except Exception as e:
-            if i == RETRY:
-                if DEBUG_FETCH:
-                    print(f"[请求失败] url={url} err={e}")
+            if i == RETRY and DEBUG_FETCH:
+                print(f"[请求失败] url={url} err={e}")
             time.sleep(0.3)
     return None
 
@@ -183,10 +168,7 @@ def parse_duration(d) -> int:
             return 0
     return 0
 
-# ========================
-# 抓取逻辑
-# ========================
-
+# ============ 抓取逻辑 ============
 def fetch_newlist(category_name: str, rid: int, limit: int) -> List[dict]:
     url = f"https://api.bilibili.com/x/web-interface/newlist?rid={rid}&ps={limit}&pn=1"
     resp = _safe_get_json(url)
@@ -197,10 +179,7 @@ def fetch_newlist(category_name: str, rid: int, limit: int) -> List[dict]:
     budget = DETAIL_CALL_LIMIT
     for item in archives[:limit]:
         stat = item.get("stat", {}) or {}
-        # 字段初步清洗: 如果 stat 内是字符串，转为数字
-        cleaned_stat = {}
-        for k, v in stat.items():
-            cleaned_stat[k] = _parse_number(v)
+        cleaned_stat = {k: _parse_number(v) for k, v in stat.items()}
         stat = cleaned_stat
         built, budget = enrich_and_build(item, category_name, stat, budget)
         if built:
@@ -217,18 +196,12 @@ def fetch_hot_ranking(category_name: str, rid: int, limit: int) -> List[dict]:
     budget = DETAIL_CALL_LIMIT
     for item in lst[:limit]:
         stat = item.get("stat", {}) or {}
-        cleaned_stat = {}
-        for k, v in stat.items():
-            cleaned_stat[k] = _parse_number(v)
+        cleaned_stat = {k: _parse_number(v) for k, v in stat.items()}
         stat = cleaned_stat
         built, budget = enrich_and_build(item, category_name, stat, budget)
         if built:
             out.append(built)
     return out
-
-# ========================
-# 构造与回退
-# ========================
 
 def _stat_zero(stat: dict) -> bool:
     return (stat.get("view", 0) + stat.get("like", 0) + stat.get("coin", 0) + stat.get("favorite", 0) +
@@ -237,7 +210,6 @@ def _stat_zero(stat: dict) -> bool:
 def enrich_and_build(item: dict, category_name: str, stat: dict, detail_budget: int) -> Tuple[Optional[dict], int]:
     try:
         zero_sum = _stat_zero(stat)
-        # 第一层 detail stat
         if zero_sum and detail_budget > 0:
             detail = fetch_detail_stat(item.get("bvid"))
             if detail:
@@ -246,7 +218,6 @@ def enrich_and_build(item: dict, category_name: str, stat: dict, detail_budget: 
                         stat[k] = int(detail.get(k, 0))
                 zero_sum = _stat_zero(stat)
                 detail_budget -= 1
-        # 第二层 view detail
         if zero_sum and detail_budget > 0:
             vstat = fetch_detail_view(item.get("bvid"))
             if vstat:
@@ -255,7 +226,6 @@ def enrich_and_build(item: dict, category_name: str, stat: dict, detail_budget: 
                         stat[k] = int(vstat.get(k, 0))
                 zero_sum = _stat_zero(stat)
                 detail_budget -= 1
-        # 第三层字段回退
         if ENABLE_FALLBACK_KEYS and zero_sum:
             changed = False
             for target, keys in FALLBACK_KEY_MAP.items():
@@ -273,12 +243,10 @@ def enrich_and_build(item: dict, category_name: str, stat: dict, detail_budget: 
                 if DEBUG_FETCH:
                     short = {k: stat.get(k) for k in ["view", "like", "coin", "favorite", "danmaku", "reply", "share"]}
                     print(f"[回退字段] cat={category_name} bvid={item.get('bvid')} stat={short}")
-        # 丢弃逻辑：仍全零且允许丢弃
         if zero_sum and DROP_ZERO_VIDEOS:
             zero_video_counter[category_name] = zero_video_counter.get(category_name, 0) + 1
             return None, detail_budget
         if zero_sum:
-            # 不丢弃但计数
             zero_video_counter[category_name] = zero_video_counter.get(category_name, 0) + 1
         else:
             nonzero_video_counter[category_name] = nonzero_video_counter.get(category_name, 0) + 1
@@ -295,10 +263,9 @@ def enrich_and_build(item: dict, category_name: str, stat: dict, detail_budget: 
             danmaku=int(stat.get("danmaku", 0) or 0),
             reply=int(stat.get("reply", 0) or 0),
             share=int(stat.get("share", 0) or 0),
-            engagement=0,  # consumer 端兜底再算
+            engagement=0,
             collect_time=datetime.now(timezone.utc)
         )
-        # pydantic v2: model_dump, v1: dict
         if hasattr(v, 'model_dump'):
             return v.model_dump(), detail_budget
         else:
@@ -311,20 +278,20 @@ def enrich_and_build(item: dict, category_name: str, stat: dict, detail_budget: 
             print(f"[构造异常] bvid={item.get('bvid')} err={e}")
     return None, detail_budget
 
-# ========================
-# Kafka 发送
-# ========================
-
+# ============ 发送与主循环 ============
 _producer: Optional[KafkaProducer] = None
 
 def get_producer() -> KafkaProducer:
     global _producer
-    import time
     retry = 0
+    servers = [s.strip() for s in (KAFKA_SERVERS or "").split(",") if s.strip()]
+    if not servers:
+        servers = ["kafka:9092"]
+    print(f"[启动] Kafka bootstrap servers = {','.join(servers)}")
     while _producer is None:
         try:
             _producer = KafkaProducer(
-                bootstrap_servers=KAFKA_SERVERS.split(','),
+                bootstrap_servers=servers,
                 value_serializer=lambda v: json.dumps(v, ensure_ascii=False, default=str).encode('utf-8'),
                 linger_ms=200,
                 retries=3,
@@ -342,7 +309,6 @@ def send(batch: List[dict], dedup_cache: set, round_id: int) -> set:
     prod = get_producer()
     sent = 0
     for v in batch:
-        # 附加 round_id
         v['round_id'] = int(round_id)
         if DEDUP:
             if v['bvid'] in dedup_cache:
@@ -357,8 +323,6 @@ def send(batch: List[dict], dedup_cache: set, round_id: int) -> set:
     prod.flush()
     print(f"✅ 发送 {sent} 条（模式={FETCH_MODE} round={round_id}）")
     return dedup_cache
-
-# 发送一条轮次结束标记
 
 def send_round_end(round_id: int):
     prod = get_producer()
@@ -388,10 +352,6 @@ def send_round_end(round_id: int):
     except Exception as e:
         print(f"[MARKER失败] round={round_id} err={e}")
 
-# ========================
-# 主循环
-# ========================
-
 _round_id = 0
 
 def one_round(dedup_cache: set) -> Tuple[set, int]:
@@ -410,7 +370,6 @@ def one_round(dedup_cache: set) -> Tuple[set, int]:
         except Exception as e:
             print(f"[抓取或发送异常] cat={name} err={e}")
         time.sleep(random.uniform(0.6, 1.1))
-    # 轮次统计输出
     if zero_video_counter or nonzero_video_counter:
         summary_parts = []
         for cat in categories.keys():
@@ -430,7 +389,6 @@ def main():
     if DEBUG_FETCH:
         print(f"detail_stat={ENABLE_DETAIL_STAT} view_detail={ENABLE_VIEW_DETAIL} fallback={ENABLE_FALLBACK_KEYS}")
     dedup_cache: set = set()
-    # 启动时等待Kafka可用
     print("[启动] 检查Kafka可用性...")
     get_producer()
     print("[启动] Kafka连接成功，开始采集...")
